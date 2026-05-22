@@ -15,6 +15,7 @@ import sys
 import os
 import fitz  # PyMuPDF
 from PIL import Image, ImageFilter, ImageEnhance
+from concurrent.futures import ProcessPoolExecutor
 import io
 
 DEVICE_W_PX = 1264
@@ -283,31 +284,59 @@ def compute_base_scale(all_regions, target_w, max_zoom):
     return min(scale, max_zoom)
 
 
+def _scan_page_worker(args):
+    """Pass 1: return only region dimensions (no image data)."""
+    input_path, page_idx, render_dpi, min_gap = args
+    doc = fitz.open(input_path)
+    regions = process_page(doc[page_idx], render_dpi, min_gap)
+    doc.close()
+    return [(rw, rh) for _, rw, rh in regions]
+
+
+def _process_page_worker(args):
+    """Pass 2: return full region image data."""
+    input_path, page_idx, render_dpi, min_gap = args
+    doc = fitz.open(input_path)
+    regions = process_page(doc[page_idx], render_dpi, min_gap)
+    doc.close()
+    return [(img.tobytes(), img.mode, img.size, rw, rh) for img, rw, rh in regions]
+
+
 def reflow_pdf(input_path, output_path, margin=40, max_zoom=2.0, render_dpi=300,
-               min_gap=None, gap_between=10):
+               min_gap=None, gap_between=10, workers=None):
     doc = fitz.open(input_path)
     total = len(doc)
+    doc.close()
     target_w = DEVICE_W_PX - 2 * margin
     target_h = DEVICE_H_PX - 2 * margin
 
     if min_gap is None:
         min_gap = max(6, int(render_dpi * 0.02))
+    if workers is None:
+        workers = min(os.cpu_count() or 4, 8)
 
-    all_regions = []
-    print(f"Reflowing {total} pages for Kindle Oasis 2 ({DEVICE_W_PX}x{DEVICE_H_PX})...")
+    args_list = [(input_path, i, render_dpi, min_gap) for i in range(total)]
 
-    for i in range(total):
-        all_regions.extend(process_page(doc[i], render_dpi, min_gap))
-        if (i + 1) % 10 == 0 or i == total - 1:
-            print(f"  Page {i+1}/{total}: {len(all_regions)} regions")
+    # Pass 1: scan all pages for region dimensions only (lightweight)
+    print(f"[1/2] Scanning {total} pages with {workers} workers...", flush=True)
+    all_dims = []
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        for i, dims in enumerate(executor.map(_scan_page_worker, args_list)):
+            all_dims.extend(dims)
+            if (i + 1) % 50 == 0 or i == total - 1:
+                print(f"  Scanned {i+1}/{total}: {len(all_dims)} regions", flush=True)
 
-    base_scale = compute_base_scale(all_regions, target_w, max_zoom)
-    print(f"Base scale: {base_scale:.2f}x")
+    base_scale = compute_base_scale(
+        [(None, rw, rh) for rw, rh in all_dims], target_w, max_zoom)
+    print(f"  Base scale: {base_scale:.2f}x", flush=True)
 
+    # Pass 2: re-process pages and write output PDF streaming
+    print(f"[2/2] Rendering and writing...", flush=True)
     out_doc = fitz.open()
     page_img = Image.new("L", (DEVICE_W_PX, DEVICE_H_PX), 255)
     cursor_y = margin
     n_pages = 0
+    n_regions = 0
 
     def flush():
         nonlocal page_img, cursor_y, n_pages
@@ -319,34 +348,38 @@ def reflow_pdf(input_path, output_path, margin=40, max_zoom=2.0, render_dpi=300,
         page_img = Image.new("L", (DEVICE_W_PX, DEVICE_H_PX), 255)
         cursor_y = margin
 
-    for region_img, rw, rh in all_regions:
-        scale = base_scale
-        if rw * scale > target_w:
-            scale = target_w / rw
-        new_w = int(rw * scale)
-        new_h = int(rh * scale)
-        if new_h > target_h:
-            scale = target_h / rh
-            new_w = int(rw * scale)
-            new_h = target_h
-        if cursor_y + new_h > DEVICE_H_PX - margin and cursor_y > margin:
-            flush()
-        resized = region_img.convert("L").resize((new_w, new_h), Image.LANCZOS)
-        resized = ImageEnhance.Contrast(resized).enhance(1.3)
-        resized = resized.filter(ImageFilter.UnsharpMask(radius=1.0, percent=80, threshold=3))
-        x_offset = margin
-        page_img.paste(resized, (x_offset, cursor_y))
-        cursor_y += new_h + gap_between
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        for i, serialized in enumerate(executor.map(_process_page_worker, args_list)):
+            for raw, mode, size, rw, rh in serialized:
+                region_img = Image.frombytes(mode, size, raw)
+                scale = base_scale
+                if rw * scale > target_w:
+                    scale = target_w / rw
+                new_w = int(rw * scale)
+                new_h = int(rh * scale)
+                if new_h > target_h:
+                    scale = target_h / rh
+                    new_w = int(rw * scale)
+                    new_h = target_h
+                if cursor_y + new_h > DEVICE_H_PX - margin and cursor_y > margin:
+                    flush()
+                resized = region_img.convert("L").resize((new_w, new_h), Image.LANCZOS)
+                resized = ImageEnhance.Contrast(resized).enhance(1.3)
+                resized = resized.filter(ImageFilter.UnsharpMask(radius=1.0, percent=80, threshold=3))
+                page_img.paste(resized, (margin, cursor_y))
+                cursor_y += new_h + gap_between
+                n_regions += 1
+            if (i + 1) % 50 == 0 or i == total - 1:
+                print(f"  Page {i+1}/{total}: {n_regions} regions, {n_pages} output pages", flush=True)
 
     if cursor_y > margin:
         flush()
 
     out_doc.save(output_path, deflate=True)
     out_doc.close()
-    doc.close()
 
     mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"Done! {total} -> {n_pages} pages ({mb:.1f} MB) -> {output_path}")
+    print(f"Done! {total} -> {n_pages} pages ({mb:.1f} MB) -> {output_path}", flush=True)
 
 
 def main():
@@ -358,6 +391,7 @@ def main():
     p.add_argument("--render-dpi", type=int, default=300, help="Render DPI (default: 300)")
     p.add_argument("--min-gap", type=int, default=None, help="Min split gap px")
     p.add_argument("--gap", type=int, default=10, help="Output region gap px (default: 10)")
+    p.add_argument("--workers", type=int, default=None, help="Parallel workers (default: cpu count)")
     args = p.parse_args()
 
     if not os.path.isfile(args.input):
@@ -367,7 +401,7 @@ def main():
         args.output = f"{base}_kindle{ext}"
 
     reflow_pdf(args.input, args.output, args.margin, args.max_zoom,
-               args.render_dpi, args.min_gap, args.gap)
+               args.render_dpi, args.min_gap, args.gap, args.workers)
 
 
 if __name__ == "__main__":
